@@ -1,0 +1,105 @@
+name: Build Mush8 iOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 180
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare Xcode
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          df -h .
+          xcodebuild -downloadComponent MetalToolchain
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          brew install xcodegen sevenzip
+
+          export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
+
+          if ! command -v rustup >/dev/null 2>&1; then
+            brew install rustup
+          fi
+
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
+          rustup target add aarch64-apple-ios --toolchain 1.98.1
+
+          echo "/opt/homebrew/opt/rustup/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Download and extract game files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GAME_PASSWORD: ${{ secrets.GAME_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$GAME_PASSWORD"
+
+          INPUT_DIR="$RUNNER_TEMP/mush8-input"
+          mkdir -p "$INPUT_DIR"
+
+          gh release download game-files \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'mush8-input.7z.*' \
+            --dir "$INPUT_DIR"
+
+          7zz x "$INPUT_DIR/mush8-input.7z.001" \
+            "-p$GAME_PASSWORD" \
+            "-o$GITHUB_WORKSPACE" \
+            -y
+
+          test -s prod.keys
+          test -s base.nsp
+          test -s upd4-0-1.nsp
+          test -s dlc.nsp
+
+          rm -f "$INPUT_DIR"/mush8-input.7z.*
+
+      - name: Build IPA
+        run: |
+          set -euo pipefail
+          bash ./make-ios.sh --ipa
+          test -s build/Mush8.ipa
+
+      - name: Encrypt IPA
+        env:
+          IPA_PASSWORD: ${{ secrets.IPA_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$IPA_PASSWORD"
+
+          cd build
+          7zz a -t7z -mx=1 -mhe=on "-p$IPA_PASSWORD" \
+            Mush8-private.7z Mush8.ipa
+
+      - name: Upload encrypted IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mush8-iOS-encrypted
+          path: build/Mush8-private.7z
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Clean up game files
+        if: always()
+        run: rm -f prod.keys base.nsp upd4-0-1.nsp dlc.nsp
